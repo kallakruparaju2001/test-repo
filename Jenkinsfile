@@ -2,48 +2,78 @@ pipeline {
     agent any
 
     environment {
-        DOCKER_HUB_CREDENTIALS = credentials('dockerhub-creds') 
-        USERNAME = "${DOCKER_HUB_CREDENTIALS_USR}"
-        PASSWORD = "${DOCKER_HUB_CREDENTIALS_PSW}"
+        DOCKER_HUB_CREDENTIALS = credentials('dockerhub-creds')  // Jenkins stored creds
+        COMMIT_ID = sh(returnStdout: true, script: "git rev-parse --short HEAD").trim()
+    }
+
+    options {
+        skipDefaultCheckout(false)  // ensure repo is checked out
+    }
+
+    triggers {
+        // GitHub Webhook trigger
+        githubPush()
+    }
+
+    parameters {
+        choice(
+            name: 'TARGET_ENV',
+            choices: ['auto', 'dev', 'prod'],
+            description: 'Select environment (auto = detect from branch)'
+        )
     }
 
     stages {
-        stage('Checkout') {
+        stage('Login to Docker Hub') {
             steps {
-                checkout scm
+                script {
+                    sh "echo ${DOCKER_HUB_CREDENTIALS_PSW} | docker login -u ${DOCKER_HUB_CREDENTIALS_USR} --password-stdin"
+                }
             }
         }
 
-        stage('Build & Push Docker Image') {
+        stage('Build & Push Image') {
             steps {
                 script {
-                    // Get short commit ID
-                    def commitId = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
-                    def envName = ""
+                    def branch = env.GIT_BRANCH ?: sh(returnStdout: true, script: "git rev-parse --abbrev-ref HEAD").trim()
+                    def targetEnv = params.TARGET_ENV
 
-                    if (env.BRANCH_NAME == "dev") {
-                        envName = "dev"
-                    } else if (env.BRANCH_NAME == "prod") {
-                        envName = "prod"
-                    } else {
-                        error("This pipeline only builds images for dev and prod branches")
+                    if (targetEnv == "auto") {
+                        if (branch == "origin/main" || branch == "main") {
+                            targetEnv = "prod"
+                        } else if (branch == "origin/dev" || branch == "dev") {
+                            targetEnv = "dev"
+                        } else {
+                            error("Branch ${branch} is not mapped to an environment")
+                        }
                     }
 
+                    echo "Deploying to environment: ${targetEnv}"
+
+                    def repoName = (targetEnv == "prod") ? "myapp-prod" : "myapp-dev"
+                    def imageName = "${DOCKER_HUB_CREDENTIALS_USR}/${repoName}:${COMMIT_ID}"
+
+                    // Build with docker-compose
                     sh """
-                        chmod +x ./build.sh
-                        USERNAME=$USERNAME PASSWORD=$PASSWORD ENV=${envName} TAG=${commitId} ./build.sh
+                        USERNAME=${DOCKER_HUB_CREDENTIALS_USR} ENV=${targetEnv} TAG=${COMMIT_ID} \
+                        docker-compose -f docker-compose.build.yml build
                     """
+
+                    // Push with docker-compose
+                    sh """
+                        USERNAME=${DOCKER_HUB_CREDENTIALS_USR} ENV=${targetEnv} TAG=${COMMIT_ID} \
+                        docker-compose -f docker-compose.build.yml push
+                    """
+
+                    echo "Image pushed: ${imageName}"
                 }
             }
         }
     }
 
     post {
-        success {
-            echo "Docker image pushed: ${env.BRANCH_NAME} branch → $USERNAME/react-app:${env.BRANCH_NAME}-${env.GIT_COMMIT[0..6]}"
-        }
-        failure {
-            echo "Docker image build/push failed for branch ${env.BRANCH_NAME}"
+        always {
+            sh 'docker logout'
         }
     }
 }
